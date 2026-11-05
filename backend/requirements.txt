@@ -6,6 +6,8 @@ python-multipart>=0.0.9
 # Database
 motor>=3.4.0
 pymongo>=4.7.2
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
 
 # Auth
 python-jose[cryptography]>=3.3.0

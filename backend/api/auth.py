@@ -1,5 +1,5 @@
 """
-Auth API — JWT-based register / login / me.
+Auth API — JWT-based register / login / me using PostgreSQL.
 """
 
 from __future__ import annotations
@@ -9,28 +9,30 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from backend.database.models import Token, TokenData, UserCreate, UserOut
-from backend.database.mongo import users_col
+from backend.database.pg_models import User
+from backend.database.postgres import get_db_session
 
-logger  = logging.getLogger(__name__)
-router  = APIRouter()
+logger = logging.getLogger(__name__)
+router = APIRouter()
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-SECRET_KEY  = os.getenv("JWT_SECRET", "changeme-in-production")
-ALGORITHM   = os.getenv("JWT_ALGORITHM", "HS256")
-EXPIRE_MIN  = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))
+SECRET_KEY = os.getenv("JWT_SECRET", "changeme-in-production")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+EXPIRE_MIN = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))
 
-pwd_ctx     = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2      = OAuth2PasswordBearer(tokenUrl="/auth/login")
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
+disable_auth = os.getenv("DISABLE_AUTH", "false").lower() in {"1", "true", "yes"}
+DEMO_EMAIL = os.getenv("DEMO_USER_EMAIL", "demo@portfolio.testmail.com")
 
 
 # ---------------------------------------------------------------------------
@@ -47,37 +49,67 @@ def _verify_password(plain: str, hashed: str) -> bool:
 
 def _create_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     payload = data.copy()
-    expire  = datetime.now(timezone.utc) + (
+    expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=EXPIRE_MIN)
     )
     payload["exp"] = expire
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
-async def get_current_user(token: str = Depends(oauth2)) -> UserOut:
-    """FastAPI dependency — resolves JWT → user."""
+def _get_or_create_demo_user() -> UserOut:
+    """Return a stable local demo user in PostgreSQL while auth is disabled."""
+    with get_db_session() as db:
+        user = db.query(User).filter(User.email == DEMO_EMAIL).first()
+        if not user:
+            user = User(
+                email=DEMO_EMAIL,
+                password_hash="auth-disabled",
+                role="user",
+                created_at=datetime.utcnow(),
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        return UserOut(
+            id=str(user.id),
+            email=user.email,
+            created_at=user.created_at,
+        )
+
+
+async def get_current_user(token: Optional[str] = Depends(oauth2)) -> UserOut:
+    """FastAPI dependency — resolves JWT → user from PostgreSQL."""
+    if disable_auth:
+        return _get_or_create_demo_user()
+
     cred_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if not token:
+        raise cred_exc
+
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if not user_id:
+        user_id_str: str = payload.get("sub")
+        if not user_id_str:
             raise cred_exc
-    except JWTError:
+        user_id = int(user_id_str)
+    except (JWTError, ValueError):
         raise cred_exc
 
-    doc = await users_col().find_one({"_id": ObjectId(user_id)})
-    if not doc:
-        raise cred_exc
+    with get_db_session() as db:
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise cred_exc
 
-    return UserOut(
-        id=str(doc["_id"]),
-        email=doc["email"],
-        created_at=doc["created_at"],
-    )
+        return UserOut(
+            id=str(user.id),
+            email=user.email,
+            created_at=user.created_at,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -86,36 +118,41 @@ async def get_current_user(token: str = Depends(oauth2)) -> UserOut:
 
 @router.post("/register", response_model=Token, status_code=status.HTTP_201_CREATED)
 async def register(payload: UserCreate):
-    """Create a new user account."""
-    existing = await users_col().find_one({"email": payload.email})
-    if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Email already registered",
+    """Create a new user account in PostgreSQL."""
+    with get_db_session() as db:
+        existing = db.query(User).filter(User.email == payload.email).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email already registered",
+            )
+        user = User(
+            email=payload.email,
+            password_hash=_hash_password(payload.password),
+            role="user",
+            created_at=datetime.utcnow(),
         )
-    doc = {
-        "email":         payload.email,
-        "password_hash": _hash_password(payload.password),
-        "created_at":    datetime.now(timezone.utc),
-    }
-    result = await users_col().insert_one(doc)
-    token  = _create_token({"sub": str(result.inserted_id)})
-    logger.info("User registered: %s", payload.email)
-    return Token(access_token=token)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        token = _create_token({"sub": str(user.id)})
+        logger.info("User registered: %s (id=%d)", payload.email, user.id)
+        return Token(access_token=token)
 
 
 @router.post("/login", response_model=Token)
 async def login(form: OAuth2PasswordRequestForm = Depends()):
-    """Authenticate and return JWT."""
-    doc = await users_col().find_one({"email": form.username})
-    if not doc or not _verify_password(form.password, doc["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-        )
-    token = _create_token({"sub": str(doc["_id"])})
-    logger.info("User login: %s", form.username)
-    return Token(access_token=token)
+    """Authenticate against PostgreSQL and return JWT."""
+    with get_db_session() as db:
+        user = db.query(User).filter(User.email == form.username).first()
+        if not user or not _verify_password(form.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+            )
+        token = _create_token({"sub": str(user.id)})
+        logger.info("User login: %s (id=%d)", form.username, user.id)
+        return Token(access_token=token)
 
 
 @router.get("/me", response_model=UserOut)

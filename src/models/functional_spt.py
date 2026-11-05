@@ -61,11 +61,11 @@ class FunctionalSPT(nn.Module):
         garch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         T, N  = x.shape
-        x_flat = x.view(-1, 1)
+        x_flat = x.reshape(-1, 1)
 
         out    = self.f1(x_flat) + self.res(x_flat)
         out    = self.f2(out)
-        f_vals = out.view(T, N)
+        f_vals = out.reshape(T, N)
 
         weights = f_vals / f_vals.sum(dim=1, keepdim=True)
 

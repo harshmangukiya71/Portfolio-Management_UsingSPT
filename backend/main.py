@@ -1,5 +1,5 @@
 """
-FastAPI application entrypoint.
+FastAPI application entrypoint (PostgreSQL-backed).
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 from backend.api import auth, model, portfolio
-from backend.database.mongo import close_db, connect_db
+from backend.database.postgres import init_postgres, test_postgres_connection
 from backend.services.ml_service import load_checkpoint_if_exists
 from backend.services.scheduler import shutdown_scheduler, start_scheduler
 
@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("=== AI Portfolio Manager starting up ===")
 
-    # Connect to MongoDB
-    await connect_db()
+    # Initialize PostgreSQL (pgAdmin tables)
+    init_postgres()
 
     # Load existing model checkpoint (if any)
     load_checkpoint_if_exists()
@@ -48,7 +48,6 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("=== Shutting down ===")
     shutdown_scheduler()
-    await close_db()
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +56,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AI Portfolio Manager API",
-    description="Production-grade AI portfolio management using Functional SPT + GARCH",
+    description="Production-grade AI portfolio management using Functional SPT + GARCH backed by PostgreSQL",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -93,10 +92,25 @@ async def health():
     return {"status": "ok", "version": "1.0.0"}
 
 
+@app.get("/db/postgres-status", tags=["Database"])
+def postgres_status():
+    """Check connectivity to PostgreSQL / pgAdmin database."""
+    try:
+        info = test_postgres_connection()
+        return {"status": "connected", "details": info}
+    except Exception as exc:
+        return {
+            "status": "disconnected",
+            "message": str(exc),
+            "hint": "Check that PostgreSQL service is running and DB credentials in .env are correct."
+        }
+
+
 @app.get("/", tags=["Health"])
 async def root():
     return {
         "message": "AI Portfolio Manager API",
         "docs":    "/docs",
         "health":  "/health",
+        "db":      "/db/postgres-status",
     }

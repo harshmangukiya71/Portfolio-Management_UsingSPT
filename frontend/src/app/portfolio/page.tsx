@@ -1,7 +1,6 @@
-"use client";
+﻿"use client";
 
-import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useState } from "react";
 import useSWR from "swr";
 import toast from "react-hot-toast";
 import { Plus, RefreshCw, Briefcase, Calendar, TrendingUp } from "lucide-react";
@@ -11,16 +10,13 @@ import AllocationTable from "@/components/AllocationTable";
 import StockModal from "@/components/StockModal";
 import { portfolioAPI, modelAPI } from "@/lib/api";
 import { formatINR } from "@/lib/utils";
+import { useAuth } from "@/lib/useAuth";
 
 export default function PortfolioPage() {
-  const router = useRouter();
-
-  useEffect(() => {
-    if (!localStorage.getItem("token")) router.push("/login");
-  }, [router]);
-
-  const [addModal, setAddModal]   = useState(false);
-  const [removing, setRemoving]   = useState<string | null>(null);
+  const { ready } = useAuth();
+  const [addModal, setAddModal] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [liquidating, setLiquidating] = useState(false);
 
   const { data: portfolios, mutate: mutatePortfolios } = useSWR(
     "portfolios",
@@ -42,30 +38,63 @@ export default function PortfolioPage() {
     { refreshInterval: 60_000 }
   );
 
-  async function handleRemove(ticker: string) {
+  const allocations = weightsData?.allocations ?? [];
+  const capital = portfolio?.capital ?? 0;
+
+  async function handleRemoveStock(ticker: string) {
     if (!portfolio) return;
-    if (!confirm(`Remove ${ticker}?\n\nIts capital will be redistributed proportionally among remaining stocks.`)) return;
     setRemoving(ticker);
     try {
       await portfolioAPI.removeStock(portfolio.id, ticker);
-      toast.success(`${ticker} removed. Model retraining…`);
+      toast.success(`${ticker} removed. Weights recalculated.`);
       mutatePortfolios();
       mutateWeights();
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to remove");
+      toast.error(err?.response?.data?.detail || "Failed to remove stock");
     } finally {
       setRemoving(null);
+    }
+  }
+
+  async function handleLiquidateAll() {
+    if (!portfolio || !allocations.length) return;
+    setLiquidating(true);
+    try {
+      for (const alloc of allocations) {
+        await portfolioAPI.exitStock(portfolio.id, alloc.ticker, alloc.allocation_inr);
+      }
+      toast.success(`All ${allocations.length} holdings liquidated. Capital moved to pocket.`);
+      mutatePortfolios();
+      mutateWeights();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || "Failed to liquidate all holdings");
+    } finally {
+      setLiquidating(false);
     }
   }
 
   async function handleRetrain() {
     if (!portfolio) return;
     try {
+      toast.loading("Training model...", { id: "manual-train" });
       await modelAPI.retrain(portfolio.id);
-      toast.success("Retraining started");
-    } catch {
-      toast.error("Failed to start retraining");
+      toast.success("Training complete", { id: "manual-train" });
+      mutatePortfolios();
+      mutateWeights();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.detail || "Training failed", { id: "manual-train" });
     }
+  }
+
+  if (!ready) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg-primary">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 rounded-full border-2 border-accent-cyan border-t-transparent animate-spin" />
+          <p className="text-text-secondary text-sm">Loading…</p>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -91,82 +120,68 @@ export default function PortfolioPage() {
           </div>
         </div>
 
-        <div className="p-8 space-y-6 animate-fade-in">
-          {/* Portfolio info cards */}
-          {portfolio && (
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="card p-5">
-                <p className="label mb-2">Total Capital</p>
-                <p className="text-2xl font-bold font-mono text-accent-cyan">
-                  {formatINR(portfolio.capital)}
-                </p>
+        <div className="p-8 space-y-8 animate-fade-in">
+          {portfolio ? (
+            <div className="card p-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-bold text-text-primary">{portfolio.name}</h2>
+                <div className="flex items-center gap-4 mt-1 text-xs text-text-muted">
+                  <span className="flex items-center gap-1">
+                    <Calendar className="w-3.5 h-3.5" />
+                    Created: {new Date(portfolio.created_at).toLocaleDateString()}
+                  </span>
+                  {portfolio.last_rebalanced && (
+                    <span className="flex items-center gap-1">
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Last rebalanced: {new Date(portfolio.last_rebalanced).toLocaleDateString()}
+                    </span>
+                  )}
+                </div>
               </div>
-              <div className="card p-5">
-                <p className="label mb-2">Holdings</p>
-                <p className="text-2xl font-bold font-mono text-text-primary">
-                  {portfolio.stocks.length} <span className="text-sm font-normal text-text-muted">stocks</span>
-                </p>
-              </div>
-              <div className="card p-5">
-                <p className="label mb-2">Last Rebalanced</p>
-                <div className="flex items-center gap-2">
-                  <Calendar className="w-4 h-4 text-text-muted" />
-                  <p className="text-sm font-medium text-text-primary">
-                    {portfolio.last_rebalanced
-                      ? new Date(portfolio.last_rebalanced).toLocaleDateString("en-IN", {
-                          day: "2-digit", month: "short", year: "numeric",
-                        })
-                      : "Never"}
-                  </p>
+
+              <div className="flex items-center gap-6">
+                <div>
+                  <p className="text-xs text-text-muted uppercase tracking-wider">Total Invested</p>
+                  <p className="text-xl font-bold text-accent-cyan">{formatINR(capital)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-text-muted uppercase tracking-wider">Holdings</p>
+                  <p className="text-xl font-bold text-text-primary">{allocations.length}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-text-muted uppercase tracking-wider">Status</p>
+                  <span className={portfolio.model_trained ? "badge-success" : "badge-warning"}>
+                    {portfolio.model_trained ? "Active" : "Training"}
+                  </span>
                 </div>
               </div>
             </div>
+          ) : (
+            <div className="card p-8 text-center">
+              <p className="text-text-muted text-sm">No portfolio found. Create one from the Dashboard.</p>
+            </div>
           )}
 
-          {/* Holdings table */}
-          <div className="card">
+          <section className="card">
             <div className="p-6 border-b border-border flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <TrendingUp className="w-4 h-4 text-accent-cyan" />
-                <h2 className="text-sm font-semibold text-text-secondary">Current Holdings</h2>
+              <div>
+                <h3 className="text-sm font-semibold text-text-primary">Current Positions</h3>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Proportionally allocated based on trained model weights
+                </p>
               </div>
-              <div className="flex items-center gap-3">
-                {weightsData?.model_trained ? (
-                  <span className="badge-success">AI Weights</span>
-                ) : (
-                  <span className="badge-warning">Equal Weights (Training…)</span>
-                )}
-                <span className="badge-info">
-                  {(weightsData?.allocations?.length ?? 0)} positions
-                </span>
-              </div>
+              <span className="badge-info">{allocations.length} positions</span>
             </div>
 
             <AllocationTable
-              allocations={weightsData?.allocations ?? []}
-              capital={weightsData?.capital ?? portfolio?.capital ?? 0}
-              onRemove={handleRemove}
-              loading={!!removing}
+              allocations={allocations}
+              capital={capital}
+              onRemove={handleRemoveStock}
+              onRemoveAll={handleLiquidateAll}
+              loading={liquidating || Boolean(removing)}
+              stockCount={portfolio?.stocks?.length ?? 0}
             />
-          </div>
-
-          {/* Stock universe chips */}
-          {portfolio && (
-            <div className="card p-6">
-              <h3 className="text-sm font-semibold text-text-secondary mb-4">Stock Universe</h3>
-              <div className="flex flex-wrap gap-2">
-                {portfolio.stocks.map((s) => (
-                  <div
-                    key={s}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-bg-tertiary border border-border text-xs font-mono text-text-secondary"
-                  >
-                    <div className="w-1.5 h-1.5 rounded-full bg-accent-cyan" />
-                    {s}
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          </section>
         </div>
       </main>
 
@@ -175,8 +190,11 @@ export default function PortfolioPage() {
           isOpen={addModal}
           onClose={() => setAddModal(false)}
           portfolioId={portfolio.id}
-          existingStocks={portfolio.stocks}
-          onSuccess={() => { mutatePortfolios(); mutateWeights(); }}
+          existingStocks={portfolio.stocks ?? []}
+          onSuccess={() => {
+            mutatePortfolios();
+            mutateWeights();
+          }}
         />
       )}
     </div>

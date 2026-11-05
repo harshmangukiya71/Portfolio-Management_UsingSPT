@@ -70,6 +70,7 @@ class _MLState:
         self.error: Optional[str] = None
         self.last_trained: Optional[datetime] = None
         self.last_metrics: Dict[str, Any] = {}
+        self.last_performance: Optional[Dict[str, Any]] = None
         self._lock = asyncio.Lock()
 
 _state = _MLState()
@@ -95,6 +96,7 @@ async def get_weights(
     """
     Return portfolio weights + ₹ allocations for `stocks`.
 
+    If stocks is empty (fully liquidated portfolio) returns ([], False) immediately.
     If no model is trained for these exact stocks, returns equal weights
     and triggers background retraining.
 
@@ -102,12 +104,40 @@ async def get_weights(
     -------
     (allocations, model_was_trained)
     """
-    # If model matches stocks → run inference
-    if _state.model is not None and set(_state.model_stocks) == set(stocks):
-        weights_dict = await _run_inference(stocks)
+    # ── Guard: nothing to do for an empty portfolio ─────────────────────
+    if not stocks:
+        return [], False
+
+    if _state.model is None:
+        load_checkpoint_if_exists()
+
+    # If model matches stocks or trained universe is a superset of stocks → run inference
+    if _state.model is not None and (set(stocks).issubset(set(_state.model_stocks)) or set(stocks) == set(_state.model_stocks)):
+        full_weights = await _run_inference(_state.model_stocks if _state.model_stocks else stocks)
+        sub_weights = {t: full_weights.get(t, 0.0) for t in stocks}
+        total_sub = sum(sub_weights.values())
+        if total_sub > 0:
+            weights_dict = {t: sub_weights[t] / total_sub for t in stocks}
+        else:
+            n = len(stocks)
+            weights_dict = {t: 1.0 / n for t in stocks}
         trained = True
+    elif _state.model is not None and _state.model_stocks:
+        # Model is available for another universe; run inference on model_stocks and project/normalize
+        full_weights = await _run_inference(_state.model_stocks)
+        matching = [t for t in stocks if t in full_weights]
+        if matching:
+            sub_weights = {t: full_weights.get(t, 0.0) for t in stocks}
+            total_sub = sum(sub_weights.values())
+            weights_dict = {t: (sub_weights[t] / total_sub if total_sub > 0 else 1.0 / len(stocks)) for t in stocks}
+            trained = True
+        else:
+            n = len(stocks)
+            weights_dict = {t: 1.0 / n for t in stocks}
+            trained = False
+            asyncio.create_task(_background_retrain(stocks))
     else:
-        # Fallback: equal weights; trigger retrain in background
+        # Fallback: equal weights only if no model checkpoint exists anywhere
         n = len(stocks)
         weights_dict = {t: 1.0 / n for t in stocks}
         trained = False
@@ -127,7 +157,21 @@ async def get_weights(
 
 async def retrain(stocks: List[str]) -> None:
     """Trigger model retraining (returns immediately; runs in background)."""
+    if not stocks:
+        logger.info("retrain called with empty stock list — skipping")
+        return
     asyncio.create_task(_background_retrain(stocks))
+
+
+async def train_now(stocks: List[str]) -> Dict[str, Any]:
+    """Train immediately and return the completed training metrics."""
+    if not stocks:
+        logger.info("train_now called with empty stock list — skipping")
+        return {}
+    await _background_retrain(stocks)
+    if _state.status == "error":
+        raise RuntimeError(_state.error or "Training failed")
+    return _state.last_metrics
 
 
 async def compute_performance(
@@ -137,11 +181,27 @@ async def compute_performance(
     Run full backtest for `stocks` and return metrics + time series.
     Blocking — runs in thread pool.
     """
+    if not stocks:
+        return {
+            "metrics": {
+                "sharpe_net": 0.0,
+                "annual_return": 0.0,
+                "volatility": 0.0,
+                "max_drawdown": 0.0,
+                "avg_turnover": 0.0,
+                "cost_drag": 0.0
+            },
+            "wealth_index": {}
+        }
+    if _state.last_performance and set(_state.last_performance.get("stocks", [])) == set(stocks):
+        return _state.last_performance["data"]
+
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
+    res = await loop.run_in_executor(
         _executor, _compute_performance_sync, stocks
     )
-
+    _state.last_performance = {"stocks": list(stocks), "data": res}
+    return res
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -187,12 +247,20 @@ def _inference_sync(stocks: List[str]) -> Dict[str, float]:
 
 async def _background_retrain(stocks: List[str]) -> None:
     """Async wrapper for blocking retrain — sets state accordingly."""
+    # ── Guard: never train on an empty universe ──────────────────────────
+    if not stocks:
+        logger.info("_background_retrain called with empty stock list — setting idle")
+        async with _state._lock:
+            _state.status = "idle"
+            _state.error  = None
+        return
+
     async with _state._lock:
         if _state.status == "training":
             logger.info("Retrain already in progress — skipping")
             return
         _state.status = "training"
-        _state.error = None
+        _state.error  = None
 
     loop = asyncio.get_event_loop()
     try:
@@ -200,12 +268,47 @@ async def _background_retrain(stocks: List[str]) -> None:
             _executor, _train_sync, stocks
         )
         async with _state._lock:
-            _state.model         = model
-            _state.model_stocks  = list(stocks)
-            _state.status        = "done"
-            _state.last_trained  = datetime.utcnow()
-            _state.last_metrics  = metrics
+            _state.model        = model
+            _state.model_stocks = list(stocks)
+            _state.status       = "done"
+            _state.last_trained = datetime.utcnow()
+            _state.last_metrics = metrics
+            _state.last_performance = None
         logger.info("Retrain complete | Sharpe(net)=%.4f", metrics.get("sharpe_net", 0))
+
+        try:
+            import json
+            meta_path = Path(CHECKPOINT_DIR) / "model_meta.json"
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "stocks": list(stocks),
+                    "metrics": metrics,
+                    "saved_at": datetime.utcnow().isoformat(),
+                }, f, indent=2)
+        except Exception as meta_err:
+            logger.warning("Could not save model metadata: %s", meta_err)
+
+        try:
+            from backend.database.postgres import get_db_session
+            from backend.database.pg_models import Portfolio, WeightHistory
+            with get_db_session() as db:
+                p = db.query(Portfolio).first()
+                if p:
+                    p.model_trained = True
+                    p.status = "active"
+                    w_inferred = _inference_sync(list(stocks))
+                    cap = float(p.capital)
+                    wh = WeightHistory(
+                        portfolio_id=p.id,
+                        date=datetime.utcnow(),
+                        weights={t: round(w_inferred.get(t, 1.0/len(stocks)), 6) for t in stocks},
+                        allocations={t: round(w_inferred.get(t, 1.0/len(stocks)) * cap, 2) for t in stocks},
+                    )
+                    db.add(wh)
+                    db.commit()
+        except Exception as db_err:
+            logger.warning("Could not update Portfolio/WeightHistory in PostgreSQL: %s", db_err)
 
     except Exception as exc:
         async with _state._lock:
@@ -340,7 +443,7 @@ def _compute_performance_sync(stocks: List[str]) -> Dict[str, Any]:
             feat["x"], feat["returns"], feat["mu"], feat["garch_rank"]
         )
 
-        if _state.model is None or set(_state.model_stocks) != set(stocks):
+        if _state.model is None:
             # No model trained yet → return empty/fallback
             return _empty_performance(stocks)
 
@@ -419,12 +522,40 @@ def _empty_performance(stocks: List[str]) -> Dict[str, Any]:
 
 def load_checkpoint_if_exists() -> None:
     """Called on startup — loads the most recent checkpoint if available."""
+    import json
     ckpt_dir = Path(CHECKPOINT_DIR)
     path = ckpt_dir / "functional_spt_best.pt"
+    meta_path = ckpt_dir / "model_meta.json"
     if path.exists():
         try:
             _state.model = FunctionalSPT.load(str(path))
+            _state.status = "done"
+            _state.last_trained = datetime.utcnow()
             logger.info("Loaded model checkpoint ← %s", path)
+
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    _state.model_stocks = meta.get("stocks", [])
+                    _state.last_metrics = meta.get("metrics", {})
+                    logger.info("Restored model metadata: stocks=%s", _state.model_stocks)
+                except Exception as meta_exc:
+                    logger.warning("Could not read %s: %s", meta_path, meta_exc)
+
+            if not _state.model_stocks:
+                try:
+                    from backend.database.postgres import get_db_session
+                    from backend.database.pg_models import Portfolio
+                    with get_db_session() as db:
+                        p = db.query(Portfolio).filter(Portfolio.model_trained == True).first()
+                        if not p:
+                            p = db.query(Portfolio).first()
+                        if p and p.stocks:
+                            _state.model_stocks = list(p.stocks)
+                            logger.info("Restored model_stocks from PostgreSQL Portfolio #%s: %s", p.id, _state.model_stocks)
+                except Exception as db_exc:
+                    logger.warning("Could not restore model_stocks from PostgreSQL: %s", db_exc)
         except Exception as exc:
             logger.warning("Could not load checkpoint %s: %s", path, exc)
     else:

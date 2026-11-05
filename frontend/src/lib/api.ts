@@ -1,6 +1,5 @@
-/**
+﻿/**
  * Typed API client for the FastAPI backend.
- * All calls include the JWT token from localStorage.
  */
 
 import axios, { AxiosInstance } from "axios";
@@ -22,13 +21,17 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Redirect to login on 401
 api.interceptors.response.use(
   (r) => r,
   (err) => {
-    if (err.response?.status === 401 && typeof window !== "undefined") {
-      localStorage.removeItem("token");
-      window.location.href = "/login";
+    // Auto-logout on 401 Unauthorized (expired / invalid token)
+    if (err?.response?.status === 401 && typeof window !== "undefined") {
+      const isAuthRoute = window.location.pathname === "/login";
+      if (!isAuthRoute) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user_email");
+        window.location.href = "/login";
+      }
     }
     return Promise.reject(err);
   }
@@ -82,6 +85,7 @@ export interface Portfolio {
   name: string;
   stocks: string[];
   capital: number;
+  cash_balance: number;
   status: string;
   model_trained: boolean;
   created_at: string;
@@ -131,8 +135,17 @@ export const portfolioAPI = {
   addStock: (portfolio_id: string, ticker: string) =>
     api.post("/portfolio/add-stock", { portfolio_id, ticker }),
 
+  addStocks: (portfolio_id: string, tickers: string[]) =>
+    api.post("/portfolio/add-stocks", { portfolio_id, tickers }),
+
   removeStock: (portfolio_id: string, ticker: string) =>
     api.post("/portfolio/remove-stock", { portfolio_id, ticker }),
+
+  reinvestFromPocket: (portfolio_id: string, amount: number) =>
+    api.post("/portfolio/reinvest-from-pocket", { portfolio_id, amount }),
+
+  exitStock: (portfolio_id: string, ticker: string, withdraw_amount: number) =>
+    api.post("/portfolio/exit-stock", { portfolio_id, ticker, withdraw_amount }),
 
   getWeights: (portfolio_id: string) =>
     api.get<WeightsResponse>("/portfolio/weights", { params: { portfolio_id } }),

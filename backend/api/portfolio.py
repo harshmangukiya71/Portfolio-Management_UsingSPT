@@ -1,4 +1,4 @@
-"""
+﻿"""
 Portfolio API — all portfolio management endpoints.
 """
 
@@ -12,9 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from backend.api.auth import get_current_user
 from backend.database.models import (
     AddStockRequest,
+    AddStocksRequest,
+    ExitStockRequest,
     PortfolioCreate,
     PortfolioOut,
     RemoveStockRequest,
+    ReinvestFromPocketRequest,
     UserOut,
 )
 from backend.services import portfolio_service
@@ -53,18 +56,6 @@ async def list_portfolios(user: UserOut = Depends(get_current_user)):
     return await portfolio_service.list_portfolios(user.id)
 
 
-@router.get("/{portfolio_id}")
-async def get_portfolio(
-    portfolio_id: str,
-    user: UserOut = Depends(get_current_user),
-):
-    """Return a single portfolio by ID."""
-    doc = await portfolio_service.get_portfolio(portfolio_id, user.id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Portfolio not found")
-    return doc
-
-
 # ---------------------------------------------------------------------------
 # Stock management
 # ---------------------------------------------------------------------------
@@ -92,6 +83,23 @@ async def add_stock(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/add-stocks")
+async def add_stocks(
+    payload: AddStocksRequest,
+    user: UserOut = Depends(get_current_user),
+):
+    """Add several stocks to a portfolio and trigger one retrain."""
+    try:
+        return await portfolio_service.add_stocks(
+            payload.portfolio_id, user.id, payload.tickers
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("add_stocks failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/remove-stock")
 async def remove_stock(
     payload: RemoveStockRequest,
@@ -115,7 +123,52 @@ async def remove_stock(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/exit-stock")
+async def exit_stock(
+    payload: ExitStockRequest,
+    user: UserOut = Depends(get_current_user),
+):
+    """
+    Exit a stock, move requested amount to cash pocket, and reinvest the rest
+    across remaining stocks through normalized model weights.
+    """
+    try:
+        return await portfolio_service.exit_stock(
+            payload.portfolio_id,
+            user.id,
+            payload.ticker,
+            payload.withdraw_amount,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("exit_stock failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ---------------------------------------------------------------------------
+@router.post("/reinvest-from-pocket")
+async def reinvest_from_pocket(
+    payload: ReinvestFromPocketRequest,
+    user: UserOut = Depends(get_current_user),
+):
+    """
+    Reinvest a specified amount from pocket (cash balance) into remaining holdings
+    proportionally using normalized weights without retraining.
+    """
+    try:
+        return await portfolio_service.reinvest_from_pocket(
+            payload.portfolio_id,
+            user.id,
+            payload.amount,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("reinvest_from_pocket failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # Weights & Performance
 # ---------------------------------------------------------------------------
 
@@ -207,3 +260,15 @@ async def update_capital(
         return await portfolio_service.update_capital(portfolio_id, user.id, capital)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/{portfolio_id}")
+async def get_portfolio(
+    portfolio_id: str,
+    user: UserOut = Depends(get_current_user),
+):
+    """Return a single portfolio by ID."""
+    doc = await portfolio_service.get_portfolio(portfolio_id, user.id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    return doc

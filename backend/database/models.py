@@ -1,37 +1,13 @@
 """
-Pydantic v2 schemas for MongoDB documents.
+Pydantic v2 schemas for API requests and responses (PostgreSQL-backed).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from bson import ObjectId
-from pydantic import BaseModel, EmailStr, Field, field_validator
-
-
-# ---------------------------------------------------------------------------
-# ObjectId helper
-# ---------------------------------------------------------------------------
-
-class PyObjectId(str):
-    @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
-
-    @classmethod
-    def validate(cls, v):
-        if isinstance(v, ObjectId):
-            return str(v)
-        if isinstance(v, str) and ObjectId.is_valid(v):
-            return v
-        raise ValueError(f"Invalid ObjectId: {v}")
-
-    @classmethod
-    def __get_pydantic_core_schema__(cls, source, handler):
-        from pydantic_core import core_schema
-        return core_schema.no_info_plain_validator_function(cls.validate)
+from pydantic import BaseModel, EmailStr, Field
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +20,7 @@ class UserCreate(BaseModel):
 
 
 class UserInDB(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[Union[str, int]] = None
     email: EmailStr
     password_hash: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -82,11 +58,12 @@ class PortfolioCreate(BaseModel):
 
 
 class PortfolioInDB(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
-    user_id: str
+    id: Optional[Union[str, int]] = None
+    user_id: Optional[Union[str, int]] = None
     name: str
     stocks: List[str]
     capital: float
+    cash_balance: float = 0.0
     status: str = "active"        # active | training | error
     model_trained: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -100,6 +77,7 @@ class PortfolioOut(BaseModel):
     name: str
     stocks: List[str]
     capital: float
+    cash_balance: float = 0.0
     status: str
     model_trained: bool
     created_at: datetime
@@ -115,9 +93,25 @@ class AddStockRequest(BaseModel):
     ticker: str = Field(min_length=1, max_length=20)
 
 
+class AddStocksRequest(BaseModel):
+    portfolio_id: str
+    tickers: List[str] = Field(default_factory=list)
+
+
 class RemoveStockRequest(BaseModel):
     portfolio_id: str
     ticker: str
+
+
+class ExitStockRequest(BaseModel):
+    portfolio_id: str
+    ticker: str
+    withdraw_amount: float = Field(default=0, ge=0)
+
+
+class ReinvestFromPocketRequest(BaseModel):
+    portfolio_id: str
+    amount: float = Field(gt=0, description="Amount in INR to reinvest from pocket into current holdings")
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +134,7 @@ class WeightsResponse(BaseModel):
 
 
 class WeightHistoryEntry(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[Union[str, int]] = None
     portfolio_id: str
     date: datetime
     weights: Dict[str, float]          # {ticker: weight}
@@ -183,7 +177,7 @@ class PerformanceResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class RebalanceRecord(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[Union[str, int]] = None
     portfolio_id: str
     date: datetime
     old_weights: Dict[str, float]
@@ -209,7 +203,7 @@ class RebalanceResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ModelMetricsRecord(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[Union[str, int]] = None
     portfolio_id: str
     date: datetime
     sharpe_gross: float
@@ -234,7 +228,7 @@ class ModelStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TransactionRecord(BaseModel):
-    id: Optional[str] = Field(default=None, alias="_id")
+    id: Optional[Union[str, int]] = None
     portfolio_id: str
     date: datetime
     type: str            # add_stock | remove_stock | rebalance | create

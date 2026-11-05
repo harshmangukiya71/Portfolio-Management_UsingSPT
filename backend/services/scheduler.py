@@ -1,5 +1,5 @@
 """
-APScheduler — periodic rebalancing every 21 trading days.
+APScheduler — periodic rebalancing every 21 trading days (PostgreSQL-backed).
 
 Runs as a background task inside the FastAPI process.
 """
@@ -13,7 +13,8 @@ from datetime import datetime, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-from backend.database.mongo import portfolios_col, rebalance_history_col
+from backend.database.pg_models import Portfolio, RebalanceHistory
+from backend.database.postgres import get_db_session
 from backend.services import ml_service
 
 logger = logging.getLogger(__name__)
@@ -47,48 +48,57 @@ async def _rebalance_all_portfolios() -> None:
     """Retrain model and rebalance every active portfolio."""
     logger.info("=== Scheduled rebalance triggered ===")
 
-    cursor = portfolios_col().find({"status": "active"})
-    portfolios = await cursor.to_list(length=500)
+    with get_db_session() as db:
+        portfolios = (
+            db.query(Portfolio)
+            .filter(Portfolio.status == "active")
+            .limit(500)
+            .all()
+        )
+        portfolios_data = [
+            {"id": p.id, "stocks": list(p.stocks or [])}
+            for p in portfolios
+        ]
 
-    if not portfolios:
+    if not portfolios_data:
         logger.info("No active portfolios to rebalance")
         return
 
-    for portfolio in portfolios:
-        portfolio_id = str(portfolio["_id"])
-        stocks = portfolio.get("stocks", [])
+    for p_item in portfolios_data:
+        portfolio_id = p_item["id"]
+        stocks = p_item["stocks"]
 
         if not stocks:
             continue
 
         try:
-            logger.info("Rebalancing portfolio %s (%d stocks)", portfolio_id, len(stocks))
+            logger.info("Rebalancing portfolio %d (%d stocks)", portfolio_id, len(stocks))
 
             # Retrain model for this stock set
             await ml_service.retrain(stocks)
 
-            # Record scheduled rebalance
-            await rebalance_history_col().insert_one({
-                "portfolio_id": portfolio_id,
-                "date":         datetime.now(timezone.utc),
-                "type":         "scheduled",
-                "old_weights":  {},
-                "new_weights":  {},
-                "turnover":     0.0,
-                "transaction_cost": 0.0,
-            })
+            now = datetime.now(timezone.utc)
+            with get_db_session() as db:
+                p = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+                if p:
+                    p.last_rebalanced = now
 
-            # Update last_rebalanced
-            await portfolios_col().update_one(
-                {"_id": portfolio["_id"]},
-                {"$set": {"last_rebalanced": datetime.now(timezone.utc)}},
-            )
+                    reb = RebalanceHistory(
+                        portfolio_id=portfolio_id,
+                        date=now,
+                        old_weights={},
+                        new_weights={},
+                        turnover=0.0,
+                        transaction_cost=0.0,
+                    )
+                    db.add(reb)
+                    db.commit()
 
-            logger.info("Portfolio %s rebalanced successfully", portfolio_id)
+            logger.info("Portfolio %d rebalanced successfully", portfolio_id)
 
         except Exception as exc:
             logger.exception(
-                "Failed to rebalance portfolio %s: %s", portfolio_id, exc
+                "Failed to rebalance portfolio %d: %s", portfolio_id, exc
             )
 
-    logger.info("=== Scheduled rebalance complete (%d portfolios) ===", len(portfolios))
+    logger.info("=== Scheduled rebalance complete (%d portfolios) ===", len(portfolios_data))

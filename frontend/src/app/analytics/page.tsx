@@ -1,7 +1,5 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
 import useSWR from "swr";
 import { BarChart3 } from "lucide-react";
 
@@ -13,12 +11,6 @@ import { portfolioAPI, modelAPI } from "@/lib/api";
 import { formatINR } from "@/lib/utils";
 
 export default function AnalyticsPage() {
-  const router = useRouter();
-
-  useEffect(() => {
-    if (!localStorage.getItem("token")) router.push("/login");
-  }, [router]);
-
   const { data: portfolios } = useSWR(
     "portfolios",
     () => portfolioAPI.list().then((r) => r.data)
@@ -94,6 +86,38 @@ export default function AnalyticsPage() {
               relativeWealth={perfData?.relative_wealth ?? []}
             />
           </section>
+
+          {perfData?.weights_history?.length ? (
+            <section className="card p-6">
+              <h3 className="text-sm font-semibold text-text-secondary mb-4">
+                21-Day Rebalance Weights
+              </h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-text-muted border-b border-border">
+                      <th className="py-2 pr-4">Date</th>
+                      {portfolio?.stocks.map((ticker) => (
+                        <th key={ticker} className="py-2 pr-4 font-mono">{ticker}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {perfData.weights_history.slice(-20).reverse().map((row) => (
+                      <tr key={String(row.date)} className="border-b border-border/50">
+                        <td className="py-2 pr-4 text-text-secondary">{String(row.date)}</td>
+                        {portfolio?.stocks.map((ticker) => (
+                          <td key={ticker} className="py-2 pr-4 font-mono text-text-primary">
+                            {(((row[ticker] as number) ?? 0) * 100).toFixed(2)}%
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          ) : null}
 
           {/* Model metrics */}
           {modelStatus?.last_metrics && (

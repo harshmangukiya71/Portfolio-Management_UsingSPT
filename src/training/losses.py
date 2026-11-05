@@ -112,8 +112,8 @@ def smoothness_penalty(model: nn.Module, x_sample: torch.Tensor) -> torch.Tensor
     -------
     scalar penalty
     """
-    x_sorted, _ = torch.sort(x_sample.view(-1))
-    x_sorted    = x_sorted.view(-1, 1)
+    x_sorted, _ = torch.sort(x_sample.reshape(-1))
+    x_sorted    = x_sorted.reshape(-1, 1)
 
     f_vals      = model.f2(model.f1(x_sorted) + model.res(x_sorted))
     first_diff  = f_vals[1:] - f_vals[:-1]

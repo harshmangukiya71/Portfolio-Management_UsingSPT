@@ -3,7 +3,14 @@
 import dynamic from "next/dynamic";
 import type { TimeSeriesPoint } from "@/lib/api";
 
-const Plot = dynamic(() => import("react-plotly.js"), { ssr: false });
+const Plot = dynamic(() => import("react-plotly.js"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex items-center justify-center h-[260px] text-text-muted text-xs">
+      Loading chart...
+    </div>
+  ),
+});
 
 interface WealthChartProps {
   spt:    TimeSeriesPoint[];
